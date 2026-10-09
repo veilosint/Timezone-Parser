@@ -1,91 +1,101 @@
-from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Form
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
-
-from parser import parse_message_log, detect_patterns
-
-RATE_LIMIT = "5/minute"
-
-limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Timezone Parser API")
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origin_regex=r"https://.*\.(lovable\.app|lovableproject\.com|lovable\.dev)|http://localhost:\d+",
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+from collections import defaultdict
+from datetime import datetime, timedelta
 
 
-class ParseRequest(BaseModel):
-    log_text: str
-    username: str | None = None
+WEEKDAYS_ONLY = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
 
 
-@app.get("/health")
-async def health_check():
-    return {"status": "ok", "service": "timezone-parser"}
+def _find_consistent_dead_zone(by_weekday, min_hours=6, max_hours=9):
+    slots = []
+    for weekday, hours in by_weekday.items():
+        slots.append((weekday, set(hours.keys())))
+
+    if not slots:
+        return None
+
+    best = None
+    total_slots = len(slots)
+
+    for length in range(max_hours, min_hours - 1, -1):
+        for start in range(24):
+            window = {(start + i) % 24 for i in range(length)}
+            empty_slots = [wd for wd, hours in slots if not (window & hours)]
+            coverage = len(empty_slots) / total_slots if total_slots else 0
+
+            if best is None or coverage > best["coverage"] or (
+                coverage == best["coverage"] and length > best["length"]
+            ):
+                best = {
+                    "start_hour": start,
+                    "end_hour": (start + length) % 24,
+                    "length": length,
+                    "empty_weekdays": empty_slots,
+                    "total_weekdays": total_slots,
+                    "coverage": coverage,
+                }
+
+    return best if best and best["coverage"] >= 0.6 else None
 
 
-@app.post("/api/parse")
-@limiter.limit(RATE_LIMIT)
-async def parse_pasted(request: Request, body: ParseRequest):
-    if not body.log_text.strip():
-        raise HTTPException(status_code=400, detail="Empty log text")
+def analyze(records, username, reference_timezone_offset=0):
+    target = username.strip().lower()
+    filtered = [
+        r for r in records
+        if r["name"].strip().lower() == target and r["weekday"] in WEEKDAYS_ONLY
+    ]
 
-    lines = body.log_text.splitlines()
-    patterns = detect_patterns(lines)
-    if not patterns:
-        raise HTTPException(
-            status_code=422,
-            detail="Could not detect a repeating pattern. Need at least 3 timestamps.",
-        )
+    if not filtered:
+        return {
+            "username": username,
+            "total_messages": 0,
+            "total_days": 0,
+            "by_weekday": {},
+            "dead_zone": None,
+            "estimated_utc_offset_range": None,
+            "message": "No weekday messages found for that username.",
+        }
 
-    records = parse_message_log(body.log_text, username_filter=body.username)
+    by_weekday = defaultdict(lambda: defaultdict(int))
+    dates_seen = set()
+
+    for rec in filtered:
+        by_weekday[rec["weekday"]][rec["hour"]] += 1
+        dates_seen.add(rec["timestamp"][:10])
+
+    formatted = {}
+    for weekday in WEEKDAYS_ONLY:
+        if weekday in by_weekday:
+            formatted[weekday] = {str(h): c for h, c in sorted(by_weekday[weekday].items())}
+
+    dead_zone = _find_consistent_dead_zone(dict(by_weekday))
+
+    estimated = None
+    if dead_zone:
+        mid = (dead_zone["start_hour"] + dead_zone["length"] / 2) % 24
+        offset = (3 - mid) % 24
+        if offset > 12:
+            offset -= 24
+        estimated = {
+            "estimated_utc_offset": round(offset),
+            "confidence": "medium" if dead_zone["coverage"] >= 0.8 else "low",
+            "sleep_window_reference": {
+                "start": dead_zone["start_hour"],
+                "end": dead_zone["end_hour"],
+            },
+        }
 
     return {
-        "detected_patterns": patterns[:3],
-        "chosen_pattern": patterns[0],
-        "total_records": len(records),
-        "records": records,
-    }
-
-
-@app.post("/api/parse-file")
-@limiter.limit(RATE_LIMIT)
-async def parse_file(
-    request: Request,
-    file: UploadFile = File(...),
-    username: str | None = Form(None),
-):
-    content = await file.read()
-    try:
-        text = content.decode("utf-8")
-    except UnicodeDecodeError:
-        try:
-            text = content.decode("latin-1")
-        except Exception:
-            raise HTTPException(status_code=400, detail="Could not decode file")
-
-    lines = text.splitlines()
-    patterns = detect_patterns(lines)
-    if not patterns:
-        raise HTTPException(
-            status_code=422,
-            detail="Could not detect a repeating pattern. Need at least 3 timestamps.",
-        )
-
-    records = parse_message_log(text, username_filter=username)
-
-    return {
-        "detected_patterns": patterns[:3],
-        "chosen_pattern": patterns[0],
-        "total_records": len(records),
-        "records": records,
+        "username": username,
+        "total_messages": len(filtered),
+        "total_days": len(dates_seen),
+        "by_weekday": formatted,
+        "dead_zone": {
+            "start_hour": dead_zone["start_hour"],
+            "end_hour": dead_zone["end_hour"],
+            "length_hours": dead_zone["length"],
+            "empty_weekdays": dead_zone["empty_weekdays"],
+            "coverage": f"{len(dead_zone['empty_weekdays'])}/{dead_zone['total_weekdays']}",
+        } if dead_zone else None,
+        "estimated_utc_offset_range": estimated,
+        "note": "Saturday and Sunday excluded from analysis.",
     }
