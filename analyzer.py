@@ -1,21 +1,36 @@
 from collections import defaultdict
+from datetime import datetime, timedelta
 
 
-WEEKDAYS_ONLY = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+ALL_WEEKDAYS = [
+    "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"
+]
+
+
+def _week_key(ts_iso):
+    """Return (year, week_number) from an ISO timestamp."""
+    dt = datetime.fromisoformat(ts_iso)
+    year, week_num, _ = dt.isocalendar()
+    return year, week_num
+
+
+def _week_label(year, week_num):
+    """Human label like 'Week 1 (Oct 06 – Oct 12)'."""
+    monday = datetime.strptime(f"{year} {week_num} 1", "%G %V %u").date()
+    sunday = monday + timedelta(days=6)
+    return f"({monday.strftime('%b %d')} – {sunday.strftime('%b %d')})"
 
 
 def analyze(records, username, reference_timezone_offset=0):
     """
-    Organize parsed records into a weekday → hour breakdown.
-    No inference, no dead-zone detection — just clean bucketing.
-    Saturday and Sunday are excluded.
+    Organize records into a week-by-week, day-by-day layout.
+    Each day lists only the hours that had messages: "14:00 (3)".
     """
     target = username.strip().lower()
 
     filtered = [
         r for r in records
         if r["name"].strip().lower() == target
-        and r["weekday"] in WEEKDAYS_ONLY
     ]
 
     if not filtered:
@@ -23,36 +38,45 @@ def analyze(records, username, reference_timezone_offset=0):
             "username": username,
             "total_messages": 0,
             "total_days": 0,
-            "by_weekday": {},
-            "hourly_totals": {},
-            "message": "No weekday messages found for that username.",
+            "weeks": [],
+            "message": "No messages found for that username.",
         }
 
-    # Bucket: weekday → hour → count
-    by_weekday = defaultdict(lambda: defaultdict(int))
-    hour_totals = defaultdict(int)
+    # Sort chronologically so weeks come out in order
+    filtered.sort(key=lambda r: r["timestamp"])
+
+    # Bucket: (year, week) → weekday → hour → count
+    weeks = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
     dates_seen = set()
 
     for rec in filtered:
-        by_weekday[rec["weekday"]][rec["hour"]] += 1
-        hour_totals[rec["hour"]] += 1
+        y, w = _week_key(rec["timestamp"])
+        weeks[(y, w)][rec["weekday"]][rec["hour"]] += 1
         dates_seen.add(rec["timestamp"][:10])
 
-    # Format: only include hours that have messages, sorted ascending
-    formatted = {}
-    for weekday in WEEKDAYS_ONLY:
-        if weekday not in by_weekday:
-            continue
-        hours = by_weekday[weekday]
-        formatted[weekday] = {str(h): c for h, c in sorted(hours.items())}
+    # Build output: ordered list of weeks
+    weeks_out = []
+    for (y, w) in sorted(weeks.keys()):
+        week_label = _week_label(y, w)
+        days = {}
+        for weekday in ALL_WEEKDAYS:
+            if weekday not in weeks[(y, w)]:
+                continue
+            hours = weeks[(y, w)][weekday]
+            if not hours:
+                continue
+            # Format: {"14": 3, "18": 1}
+            days[weekday] = {str(h): c for h, c in sorted(hours.items())}
 
-    hourly = {str(h): c for h, c in sorted(hour_totals.items())}
+        if days:
+            weeks_out.append({
+                "week_label": week_label,
+                "days": days,
+            })
 
     return {
         "username": username,
         "total_messages": len(filtered),
         "total_days": len(dates_seen),
-        "by_weekday": formatted,
-        "hourly_totals": hourly,
-        "note": "Saturday and Sunday excluded. Empty hours omitted.",
+        "weeks": weeks_out,
     }
