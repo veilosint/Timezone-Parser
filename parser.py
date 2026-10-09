@@ -52,11 +52,59 @@ def _extract_timestamp(line: str) -> Optional[tuple[int, int, Optional[datetime.
 
 
 # ------------------------------------------------------------------
-# Username candidate detection
+# Username extraction
 # ------------------------------------------------------------------
 
+STOP_WORDS = {
+    "post", "posts", "profile", "comment", "comments", "forum",
+    "thread", "reply", "replies", "message", "messages", "today",
+    "yesterday", "at", "on", "in", "by", "from", "to", "the", "a",
+    "an", "and", "or", "of", "for", "with", "is", "was", "are",
+    "am", "pm", "just", "now", "ok", "okay", "yes", "no", "yeah",
+    "hey", "hi", "hello", "morning", "evening", "night", "afternoon",
+    "sure", "same", "cool", "done", "back", "meeting", "lunch",
+    "working", "wrapping",
+}
+
+
+def _is_username_like(token: str) -> bool:
+    """A username is 2+ chars, alphanumeric (with _ - .), and not a stop word."""
+    if not token or len(token) < 2 or len(token) > 40:
+        return False
+    if not re.match(r"^[A-Za-z0-9_\-\.]+$", token):
+        return False
+    if token.lower() in STOP_WORDS:
+        return False
+    if token.isdigit():
+        return False
+    return True
+
+
+def _extract_name_from_line(line: str) -> Optional[str]:
+    """
+    Extract a name from a line that has a timestamp on it.
+    Removes the timestamp portion first, then finds the first username-like token.
+    """
+    # Remove time (HH:MM AM/PM or HH:MM)
+    cleaned = re.sub(r"\b\d{1,2}:\d{2}\s*([AaPp][Mm])?\b", " ", line)
+    # Remove dates
+    cleaned = re.sub(r"\b\d{4}-\d{1,2}-\d{1,2}\b", " ", cleaned)
+    cleaned = re.sub(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", " ", cleaned)
+    cleaned = re.sub(r"\b(Today|Yesterday)\b", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(January|February|March|April|May|June|July|August|September|October|November|December)\b",
+                     " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b",
+                     " ", cleaned, flags=re.IGNORECASE)
+
+    # Find first username-like token
+    for token in re.findall(r"[A-Za-z0-9_\-\.]+", cleaned):
+        if _is_username_like(token):
+            return token
+    return None
+
+
 def _is_short_token(line: str) -> Optional[str]:
-    """A username candidate: short line, no spaces, no timestamp, alphanumeric."""
+    """A line that contains only a username-like token (no spaces)."""
     line = line.strip()
     if not line or len(line) > 40:
         return None
@@ -64,9 +112,9 @@ def _is_short_token(line: str) -> Optional[str]:
         return None
     if _extract_timestamp(line):
         return None
-    if not re.match(r"^[A-Za-z0-9_\-\.]+$", line):
-        return None
-    return line
+    if _is_username_like(line):
+        return line
+    return None
 
 
 # ------------------------------------------------------------------
@@ -74,7 +122,10 @@ def _is_short_token(line: str) -> Optional[str]:
 # ------------------------------------------------------------------
 
 def detect_patterns(lines: list[str], min_occurrences: int = 3) -> list[dict]:
-    """Find repeating (short_token, timestamp) pairs, ranked by consistency."""
+    """
+    Find repeating (name, timestamp) pairs at various offsets,
+    including offset 0 (name on the same line as timestamp).
+    """
     ts_indices = [i for i, ln in enumerate(lines) if _extract_timestamp(ln)]
     if len(ts_indices) < min_occurrences:
         return []
@@ -83,6 +134,14 @@ def detect_patterns(lines: list[str], min_occurrences: int = 3) -> list[dict]:
     offset_examples = defaultdict(list)
 
     for idx in ts_indices:
+        # Offset 0: name on the same line
+        name = _extract_name_from_line(lines[idx])
+        if name:
+            offset_counts[0] += 1
+            if len(offset_examples[0]) < 5:
+                offset_examples[0].append(name)
+
+        # Offsets 1-5: name on a line above
         for offset in range(1, 6):
             if idx - offset < 0:
                 break
@@ -125,11 +184,14 @@ def extract_records(lines: list[str], pattern: dict) -> list[dict]:
         if date is None:
             continue
 
-        token_idx = idx - offset
-        if token_idx < 0:
-            continue
+        if offset == 0:
+            name = _extract_name_from_line(line)
+        else:
+            token_idx = idx - offset
+            if token_idx < 0:
+                continue
+            name = _is_short_token(lines[token_idx])
 
-        name = _is_short_token(lines[token_idx])
         if not name:
             continue
 
@@ -146,8 +208,11 @@ def extract_records(lines: list[str], pattern: dict) -> list[dict]:
     return records
 
 
-def filter_by_consistency(records: list[dict], drop_below: float = 0.5) -> list[dict]:
-    """Drop records whose username is rare in the file."""
+def filter_by_consistency(records: list[dict], drop_below: float = 0.3) -> list[dict]:
+    """
+    Drop records whose username is rare.
+    Lowered threshold from 0.5 to 0.3 to handle multi-user logs.
+    """
     if not records:
         return records
     name_counts = Counter(r["name"] for r in records)
@@ -180,33 +245,27 @@ def parse_message_log(text: str, username_filter: Optional[str] = None) -> list[
 
 
 # ------------------------------------------------------------------
-# Quick test when run directly
+# Quick test
 # ------------------------------------------------------------------
 
 if __name__ == "__main__":
     SAMPLE = """
-BRO I AM THE BEST ENG
-TESTDUMMY123
-Today at 12:40 PM
-ewgg23t
-
-BRO I AM NOT THE BEST ENG
-TESTDUMMY123
-Today at 12:41 PM
-ewqg3
-
-hello world this is another message
-OTHERUSER456
-Today at 3:15 PM
-hey how are you
-
-TESTDUMMY123
-Today at 5:00 PM
-back again
+Alice 2026-10-06 09:15
+Morning
+Bob 2026-10-06 09:20
+Morning
+Alice 2026-10-06 13:45
+Lunch?
+Bob 2026-10-06 13:50
+Sure
+Alice 2026-10-06 18:30
+Done for the day
+Bob 2026-10-06 18:35
+Same
 """
-    print("=== DETECTED PATTERNS ===")
+    print("=== PATTERNS ===")
     for p in detect_patterns(SAMPLE.splitlines()):
-        print(f"  offset={p['token_offset']}  score={p['score']}  occurrences={p['occurrences']}")
+        print(f"  offset={p['token_offset']}  score={p['score']}  occurrences={p['occurrences']}  examples={p['examples']}")
 
     print("\n=== RECORDS ===")
     for r in parse_message_log(SAMPLE):
