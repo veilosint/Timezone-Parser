@@ -1,168 +1,157 @@
+"""
+Timestamp extractor (pure Python, no dependencies).
+
+RULES
+-----
+A line produces a timestamp only if ALL of these are on the SAME line:
+  1. the target username (whole word, case-insensitive)
+  2. a valid time: either AM/PM ("9:41 AM", "9pm") or 24-hour with a
+     two-digit hour ("09:41", "21:05"). A bare "9:41" is ambiguous -> omitted.
+  3. a date: today, yesterday, a weekday name ("Friday"), or an explicit
+     date ("9/2", "9/23/2026", "September 23", "23 Sep 2026", "2026-09-23",
+     "23.09.2026").
+
+OMITTED
+-------
+  - date but no time
+  - time but no date
+  - relative times: "2 minutes ago", "an hour ago", "just now"
+  - username and time on different lines
+"""
 import re
-from datetime import datetime, timedelta
+from datetime import date, timedelta
 from typing import Optional
 
+_MONTH_NAMES = (
+    r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|"
+    r"aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?"
+)
+_MONTH_NUM = {m: i + 1 for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"])}
+_WEEKDAY_NUM = {d: i for i, d in enumerate(
+    ["mon", "tue", "wed", "thu", "fri", "sat", "sun"])}
 
-# ------------------------------------------------------------------
-# Timestamp detection
-# ------------------------------------------------------------------
+# ---- relative phrases to discard ("2 minutes ago", "just now") ------------
+_RELATIVE_RE = re.compile(
+    r"\b(?:\d+|a\s+few|a\s+couple(?:\s+of)?|an?|one|few|several|couple)\s*"
+    r"(?:seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|weeks?|months?|years?)\s+ago\b"
+    r"|\bjust\s+now\b|\b(?:a\s+)?moments?\s+ago\b",
+    re.I,
+)
 
-def _extract_timestamp(line: str):
-    """
-    Return (hour, minute, date_or_None) if the line has a time.
-    Otherwise return None.
-    """
-    now = datetime.now()
-    hour = None
-    minute = None
+# ---- times ----------------------------------------------------------------
+_AMPM_RE = re.compile(
+    r"(?<![\d:])(\d{1,2})(?::([0-5]\d))?(?::[0-5]\d)?\s*([AaPp])\.?[Mm]\b\.?")
+_24H_RE = re.compile(
+    r"(?<![\d:.])([01]\d|2[0-3]):([0-5]\d)(?::[0-5]\d)?(?![\d:]|\s*[AaPp]\.?[Mm]\b)")
 
-    # AM/PM time (most specific)
-    m = re.search(r"\b(\d{1,2}):(\d{2})\s*([AaPp][Mm])\b", line)
-    if m:
-        hour = int(m.group(1))
-        minute = int(m.group(2))
-        ampm = m.group(3).upper()
-        hour = (0 if hour == 12 else hour) if ampm == "AM" else (12 if hour == 12 else hour + 12)
-    else:
-        # 24-hour or bare HH:MM
-        m = re.search(r"\b([01]?\d|2[0-3]):(\d{2})\b", line)
-        if not m:
-            return None
-        hour = int(m.group(1))
-        minute = int(m.group(2))
-
-    # Optional date on the same line
-    date = None
-    if re.search(r"\bToday\b", line, re.IGNORECASE):
-        date = now.date()
-    elif re.search(r"\bYesterday\b", line, re.IGNORECASE):
-        date = (now - timedelta(days=1)).date()
-    else:
-        m = re.search(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b", line)
-        if m:
-            try:
-                date = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))).date()
-            except ValueError:
-                pass
-        else:
-            m = re.search(r"\b(\d{1,2})/(\d{1,2})/(\d{2,4})\b", line)
-            if m:
-                try:
-                    year = int(m.group(3))
-                    if year < 100:
-                        year += 2000
-                    date = datetime(year, int(m.group(1)), int(m.group(2))).date()
-                except ValueError:
-                    pass
-
-    return hour, minute, date
+# ---- dates ----------------------------------------------------------------
+_REL_DAY_RE = re.compile(r"\b(today|yesterday)\b", re.I)
+_WEEKDAY_FULL_RE = re.compile(
+    r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", re.I)
+# abbreviations only count when directly followed by a time/date ("Sat 9:10 PM"),
+# so ordinary words like "sat down" are not mistaken for weekdays
+_WEEKDAY_ABBR_RE = re.compile(
+    r"\b(mon|tues?|wed|thu(?:rs?)?|fri|sat|sun)\.?,?\s+(?:at\s+)?(?=\d|@T@)", re.I)
+_NAMED_MDY_RE = re.compile(
+    rf"\b({_MONTH_NAMES})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:,?\s+(\d{{4}}))?\b", re.I)
+_NAMED_DMY_RE = re.compile(
+    rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({_MONTH_NAMES})\.?(?:,?\s+(\d{{4}}))?\b", re.I)
+_ISO_RE = re.compile(r"(?<![\d])(\d{4})-(\d{2})-(\d{2})(?![\d])")
+_SLASH_RE = re.compile(r"(?<![\d/])(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?(?![\d/])")
+_DOT_RE = re.compile(r"(?<![\d.])(\d{1,2})\.(\d{1,2})\.(\d{2,4})(?![\d.])")
 
 
-# ------------------------------------------------------------------
-# Username detection
-# ------------------------------------------------------------------
-
-STOP_WORDS = {
-    "post", "posts", "profile", "comment", "comments", "forum",
-    "thread", "reply", "replies", "message", "messages", "today",
-    "yesterday", "at", "on", "in", "by", "from", "to", "the", "a",
-    "an", "and", "or", "of", "for", "with", "is", "was", "are",
-    "am", "pm", "just", "now", "ok", "okay", "yes", "no", "yeah",
-    "hey", "hi", "hello", "morning", "evening", "night", "afternoon",
-    "sure", "same", "cool", "done", "back", "meeting", "lunch",
-    "working", "wrapping",
-}
-
-def _is_username_like(token: str) -> bool:
-    if not token or len(token) < 2 or len(token) > 40:
-        return False
-    if not re.match(r"^[A-Za-z0-9_\-\.]+$", token):
-        return False
-    if token.lower() in STOP_WORDS:
-        return False
-    if token.isdigit():
-        return False
-    return True
+def _find_time(s: str):
+    """Earliest valid time in s -> (start, end, hour24, minute) or None."""
+    cands = []
+    for m in _AMPM_RE.finditer(s):
+        h = int(m.group(1))
+        if not 1 <= h <= 12:
+            continue
+        mi = int(m.group(2) or 0)
+        ap = m.group(3).lower()
+        h = (0 if h == 12 else h) + (12 if ap == "p" else 0)
+        cands.append((m.start(), m.end(), h, mi))
+    for m in _24H_RE.finditer(s):
+        cands.append((m.start(), m.end(), int(m.group(1)), int(m.group(2))))
+    return min(cands, key=lambda c: c[0]) if cands else None
 
 
-def _extract_username(line: str, time_str: str, date_str: str) -> Optional[str]:
-    """
-    Strip the time and date from the line, then return the first
-    token that looks like a username.
-    """
-    cleaned = line
-    if time_str:
-        cleaned = cleaned.replace(time_str, " ")
-    if date_str:
-        cleaned = cleaned.replace(date_str, " ")
-
-    for token in re.findall(r"[A-Za-z0-9_\-\.]+", cleaned):
-        if _is_username_like(token):
-            return token
-    return None
+def _year_for(month: int, day: int, year: Optional[int], ref: date) -> Optional[date]:
+    try:
+        if year is not None:
+            return date(year + 2000 if year < 100 else year, month, day)
+        d = date(ref.year, month, day)
+        return d if d <= ref else date(ref.year - 1, month, day)  # most recent past
+    except ValueError:
+        return None
 
 
-# ------------------------------------------------------------------
-# Line-level parser
-# ------------------------------------------------------------------
+def _find_date(s: str, ref: date, day_first: bool) -> Optional[date]:
+    """Earliest date expression in s (time already masked as @T@)."""
+    cands: list[tuple[int, date]] = []
 
-def parse_message_log(text: str, username_filter: Optional[str] = None) -> list[dict]:
-    """
-    Scan every line. If it contains BOTH a time and a username-like token,
-    extract them and return a record.
+    for m in _REL_DAY_RE.finditer(s):
+        cands.append((m.start(), ref if m.group(1).lower() == "today"
+                      else ref - timedelta(days=1)))
 
-    No pattern detection. No multi-line handling. Just line-by-line grep.
-    """
-    records = []
+    for rx, abbr in ((_WEEKDAY_FULL_RE, False), (_WEEKDAY_ABBR_RE, True)):
+        for m in rx.finditer(s):
+            target = _WEEKDAY_NUM[m.group(1).lower()[:3]]
+            cands.append((m.start(), ref - timedelta(days=(ref.weekday() - target) % 7)))
 
+    for m in _NAMED_MDY_RE.finditer(s):
+        d = _year_for(_MONTH_NUM[m.group(1).lower()[:3]], int(m.group(2)),
+                      int(m.group(3)) if m.group(3) else None, ref)
+        if d:
+            cands.append((m.start(), d))
+    for m in _NAMED_DMY_RE.finditer(s):
+        d = _year_for(_MONTH_NUM[m.group(2).lower()[:3]], int(m.group(1)),
+                      int(m.group(3)) if m.group(3) else None, ref)
+        if d:
+            cands.append((m.start(), d))
+
+    for m in _ISO_RE.finditer(s):
+        try:
+            cands.append((m.start(), date(int(m.group(1)), int(m.group(2)), int(m.group(3)))))
+        except ValueError:
+            pass
+
+    for rx in (_SLASH_RE, _DOT_RE):
+        for m in rx.finditer(s):
+            a, b = int(m.group(1)), int(m.group(2))
+            month, day = (b, a) if day_first else (a, b)
+            if month > 12:           # unambiguous: first number must be the day
+                month, day = day, month
+            d = _year_for(month, day, int(m.group(3)) if m.group(3) else None, ref)
+            if d:
+                cands.append((m.start(), d))
+
+    return min(cands, key=lambda c: c[0])[1] if cands else None
+
+
+def extract_timestamps(text: str, target: str, ref: date, day_first: bool = False):
+    """Returns a chronologically sorted list of {"date": "YYYY-MM-DD", "time": "HH:MM"}."""
+    target = target.strip()
+    if not target:
+        return []
+    name_re = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(target) + r"(?![A-Za-z0-9_])", re.I)
+
+    out = []
     for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
+        if not name_re.search(line):
+            continue                                   # username must be on this line
+        cleaned = _RELATIVE_RE.sub(" ", line)          # drop "2 minutes ago" etc.
+        t = _find_time(cleaned)
+        if t is None:
+            continue                                   # no valid time -> omit
+        start, end, hour, minute = t
+        masked = cleaned[:start] + " @T@ " + cleaned[end:]
+        d = _find_date(masked, ref, day_first)
+        if d is None:
+            continue                                   # no date -> omit
+        out.append({"date": d.isoformat(), "time": f"{hour:02d}:{minute:02d}"})
 
-        ts = _extract_timestamp(line)
-        if not ts:
-            continue
-
-        hour, minute, date = ts
-
-        # Find the raw time and date substrings so we can strip them before
-        # looking for the username.
-        time_match = re.search(r"\d{1,2}:\d{2}\s*[AaPp][Mm]?", line)
-        time_str = time_match.group(0) if time_match else ""
-
-        date_match = re.search(
-            r"(\d{4}-\d{1,2}-\d{1,2})|(\d{1,2}/\d{1,2}/\d{2,4})|(Today)|(Yesterday)",
-            line, re.IGNORECASE
-        )
-        date_str = date_match.group(0) if date_match else ""
-
-        name = _extract_username(line, time_str, date_str)
-        if not name:
-            continue
-
-        # If no date on the line, use today
-        if date is None:
-            date = datetime.now().date()
-
-        dt = datetime.combine(date, datetime.min.time()).replace(hour=hour, minute=minute)
-
-        records.append({
-            "name": name,
-            "timestamp": dt.isoformat(),
-            "hour": hour,
-            "minute": minute,
-            "weekday": dt.strftime("%A"),
-            "ampm": "AM" if hour < 12 else "PM",
-            "raw_line": line,
-        })
-
-    # Optional filter to one username
-    if username_filter:
-        target = username_filter.strip().lower()
-        records = [r for r in records if r["name"].lower() == target]
-
-    # Sort chronologically
-    records.sort(key=lambda r: r["timestamp"])
-
-    return records
+    out.sort(key=lambda x: (x["date"], x["time"]))
+    return out
