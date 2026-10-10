@@ -17,6 +17,7 @@ from pydantic import BaseModel
 
 from analyzer import analyze
 from extractor import decode_upload, extract_timestamps
+from heatmap import build_heatmap
 from timezones import dropdown_options, display_label, resolve_timezone
 
 app = FastAPI(title="Timestamp Extraction API")
@@ -118,5 +119,24 @@ def analyze_deadzone(req: AnalyzeRequest):
         items = [{"date": t.date, "time": t.time} for t in req.timestamps]
         return analyze(items, tz, display_label(req.timezone),
                        req.bed_window, req.wake_window)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+# --------------------------------------------------------------------------
+# Heatmap: total messages per weekday per hour, summed across all weeks
+# --------------------------------------------------------------------------
+class HeatmapRequest(BaseModel):
+    timezone: str = "UTC"                # the timezone the timestamps are written in
+    timestamps: list[TimestampItem]      # exactly what /api/extract returns
+
+
+@app.post("/api/heatmap")
+def heatmap(req: HeatmapRequest):
+    """Counts per weekday and hour (24 values per day) for the frontend heatmap."""
+    try:
+        resolve_timezone(req.timezone)   # validates the label
+        items = [{"date": t.date, "time": t.time} for t in req.timestamps]
+        return build_heatmap(items, display_label(req.timezone))
     except ValueError as e:
         raise HTTPException(400, str(e))
