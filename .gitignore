@@ -1,10 +1,25 @@
+# Python
 __pycache__/
 *.py[cod]
 .venv/
 venv/
+.pytest_cache/
+
+# Secrets - never commit these
 .env
+*.key
+
+# Real message exports - never commit private data
+*.txt
+!requirements.txt
+data/
+uploads/
+
+# Old versions / backups
+*.bak
+main_old.py
+
+# OS / editor
+.DS_Store
 .vscode/
 .idea/
-.DS_Store
-*.log
-.render/
