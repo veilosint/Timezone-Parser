@@ -15,6 +15,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from analyzer import analyze
 from extractor import decode_upload, extract_timestamps
 from timezones import dropdown_options, display_label, resolve_timezone
 
@@ -88,3 +89,34 @@ async def extract_file(
     ref = _reference_date(timezone, ref_date)
     text = decode_upload(data)
     return _response(timezone, extract_timestamps(text, target, ref, day_first))
+
+
+# --------------------------------------------------------------------------
+# Deadzone analysis: timestamps in -> likely timezones out
+# --------------------------------------------------------------------------
+class TimestampItem(BaseModel):
+    date: str   # "YYYY-MM-DD"
+    time: str   # "HH:MM" (24-hour)
+
+
+class AnalyzeRequest(BaseModel):
+    timezone: str = "UTC"                # the timezone the timestamps are written in
+    timestamps: list[TimestampItem]      # exactly what /api/extract returns
+    bed_window: str = "21:30-00:30"      # typical bedtime range
+    wake_window: str = "06:00-09:00"     # typical wake-up range
+
+
+@app.post("/api/analyze")
+def analyze_deadzone(req: AnalyzeRequest):
+    """
+    Finds each night's deadzone (longest silence), averages them, and ranks the
+    timezones whose local clock makes that deadzone look like normal sleep.
+    Paste the output of /api/extract straight in as the request body.
+    """
+    try:
+        tz = resolve_timezone(req.timezone)
+        items = [{"date": t.date, "time": t.time} for t in req.timestamps]
+        return analyze(items, tz, display_label(req.timezone),
+                       req.bed_window, req.wake_window)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
