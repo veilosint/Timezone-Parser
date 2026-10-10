@@ -11,11 +11,11 @@ from datetime import date, datetime
 from typing import Optional
 from zoneinfo import ZoneInfo, available_timezones
  
-from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
  
-from extractor import extract_timestamps
+from extractor import decode_upload, extract_timestamps
  
 app = FastAPI(title="Timestamp Extraction API")
 app.add_middleware(
@@ -54,16 +54,31 @@ def extract(req: ExtractRequest):
     return {"timestamps": extract_timestamps(req.text, req.target, ref, req.day_first)}
  
  
-@app.post("/api/extract-raw")
-def extract_raw(
-    text: str = Body(..., media_type="text/plain",
-                     description="Paste the raw text here, no JSON needed."),
-    target: str = Query(..., description="Exact username"),
-    timezone: str = Query("UTC"),
-    reference_date: Optional[date] = Query(None, description="YYYY-MM-DD; defaults to today"),
-    day_first: bool = Query(False),
-):
-    """Same as /api/extract, with a plain-text body for easy testing in /docs."""
-    ref = _reference_date(timezone, reference_date)
-    return {"timestamps": extract_timestamps(text, target, ref, day_first)}
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB
  
+ 
+@app.post("/api/extract-file")
+async def extract_file(
+    file: UploadFile = File(..., description="A text export (.txt, .log, .csv, ...)"),
+    target: str = Form(..., description="Exact username"),
+    timezone: str = Form("UTC"),
+    reference_date: Optional[str] = Form(None, description="YYYY-MM-DD; blank = today"),
+    day_first: bool = Form(False),
+):
+    """Same as /api/extract, but the text comes from an uploaded file."""
+    data = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, "File too large (10 MB max).")
+    if not data:
+        raise HTTPException(400, "The uploaded file is empty.")
+ 
+    ref_date = None
+    if reference_date and reference_date.strip():
+        try:
+            ref_date = date.fromisoformat(reference_date.strip())
+        except ValueError:
+            raise HTTPException(400, "reference_date must be YYYY-MM-DD.")
+ 
+    ref = _reference_date(timezone, ref_date)
+    text = decode_upload(data)
+    return {"timestamps": extract_timestamps(text, target, ref, day_first)}
