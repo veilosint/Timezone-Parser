@@ -36,10 +36,19 @@ def build_heatmap(items: list[dict], label: str) -> dict:
             occurrences[d.weekday()] += 1
             d += timedelta(days=1)
 
+    totals = [sum(grid[w]) for w in range(7)]
+    averages = [round(totals[w] / occurrences[w], 1) if occurrences[w] else 0.0 for w in range(7)]
+
     return {
         "timezone": label,
         "total_messages": len(items),
         "max": max((c for row in grid for c in row), default=0),
+        # for a bar chart: one bar per weekday
+        "weekday_totals": {
+            "labels": DAY_NAMES,
+            "totals": totals,              # all Mondays added together, all Tuesdays, ...
+            "average_per_day": averages,   # totals / how many of that weekday are in the data
+        },
         "hour_labels": HOUR_LABELS,
         "days": [{"day": DAY_NAMES[w], "hours": grid[w], "total": sum(grid[w]),
                   "occurrences": occurrences[w]} for w in range(7)],
