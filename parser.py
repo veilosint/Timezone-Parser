@@ -1,5 +1,4 @@
 import re
-from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -8,10 +7,16 @@ from typing import Optional
 # Timestamp detection
 # ------------------------------------------------------------------
 
-def _extract_timestamp(line: str) -> Optional[tuple[int, int, Optional[datetime.date]]]:
-    """If the line contains a time (and optionally a date), return (hour, minute, date_or_None)."""
+def _extract_timestamp(line: str):
+    """
+    Return (hour, minute, date_or_None) if the line has a time.
+    Otherwise return None.
+    """
     now = datetime.now()
+    hour = None
+    minute = None
 
+    # AM/PM time (most specific)
     m = re.search(r"\b(\d{1,2}):(\d{2})\s*([AaPp][Mm])\b", line)
     if m:
         hour = int(m.group(1))
@@ -19,12 +24,14 @@ def _extract_timestamp(line: str) -> Optional[tuple[int, int, Optional[datetime.
         ampm = m.group(3).upper()
         hour = (0 if hour == 12 else hour) if ampm == "AM" else (12 if hour == 12 else hour + 12)
     else:
+        # 24-hour or bare HH:MM
         m = re.search(r"\b([01]?\d|2[0-3]):(\d{2})\b", line)
         if not m:
             return None
         hour = int(m.group(1))
         minute = int(m.group(2))
 
+    # Optional date on the same line
     date = None
     if re.search(r"\bToday\b", line, re.IGNORECASE):
         date = now.date()
@@ -52,7 +59,7 @@ def _extract_timestamp(line: str) -> Optional[tuple[int, int, Optional[datetime.
 
 
 # ------------------------------------------------------------------
-# Username extraction
+# Username detection
 # ------------------------------------------------------------------
 
 STOP_WORDS = {
@@ -66,9 +73,7 @@ STOP_WORDS = {
     "working", "wrapping",
 }
 
-
 def _is_username_like(token: str) -> bool:
-    """A username is 2+ chars, alphanumeric (with _ - .), and not a stop word."""
     if not token or len(token) < 2 or len(token) > 40:
         return False
     if not re.match(r"^[A-Za-z0-9_\-\.]+$", token):
@@ -80,193 +85,84 @@ def _is_username_like(token: str) -> bool:
     return True
 
 
-def _extract_name_from_line(line: str) -> Optional[str]:
+def _extract_username(line: str, time_str: str, date_str: str) -> Optional[str]:
     """
-    Extract a name from a line that has a timestamp on it.
-    Removes the timestamp portion first, then finds the first username-like token.
+    Strip the time and date from the line, then return the first
+    token that looks like a username.
     """
-    # Remove time (HH:MM AM/PM or HH:MM)
-    cleaned = re.sub(r"\b\d{1,2}:\d{2}\s*([AaPp][Mm])?\b", " ", line)
-    # Remove dates
-    cleaned = re.sub(r"\b\d{4}-\d{1,2}-\d{1,2}\b", " ", cleaned)
-    cleaned = re.sub(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", " ", cleaned)
-    cleaned = re.sub(r"\b(Today|Yesterday)\b", " ", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\b(January|February|March|April|May|June|July|August|September|October|November|December)\b",
-                     " ", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b",
-                     " ", cleaned, flags=re.IGNORECASE)
+    cleaned = line
+    if time_str:
+        cleaned = cleaned.replace(time_str, " ")
+    if date_str:
+        cleaned = cleaned.replace(date_str, " ")
 
-    # Find first username-like token
     for token in re.findall(r"[A-Za-z0-9_\-\.]+", cleaned):
         if _is_username_like(token):
             return token
     return None
 
 
-def _is_short_token(line: str) -> Optional[str]:
-    """A line that contains only a username-like token (no spaces)."""
-    line = line.strip()
-    if not line or len(line) > 40:
-        return None
-    if " " in line:
-        return None
-    if _extract_timestamp(line):
-        return None
-    if _is_username_like(line):
-        return line
-    return None
-
-
 # ------------------------------------------------------------------
-# Pattern detection
+# Line-level parser
 # ------------------------------------------------------------------
 
-def detect_patterns(lines: list[str], min_occurrences: int = 3) -> list[dict]:
+def parse_message_log(text: str, username_filter: Optional[str] = None) -> list[dict]:
     """
-    Find repeating (name, timestamp) pairs at various offsets,
-    including offset 0 (name on the same line as timestamp).
+    Scan every line. If it contains BOTH a time and a username-like token,
+    extract them and return a record.
+
+    No pattern detection. No multi-line handling. Just line-by-line grep.
     """
-    ts_indices = [i for i, ln in enumerate(lines) if _extract_timestamp(ln)]
-    if len(ts_indices) < min_occurrences:
-        return []
-
-    offset_counts = Counter()
-    offset_examples = defaultdict(list)
-
-    for idx in ts_indices:
-        # Offset 0: name on the same line
-        name = _extract_name_from_line(lines[idx])
-        if name:
-            offset_counts[0] += 1
-            if len(offset_examples[0]) < 5:
-                offset_examples[0].append(name)
-
-        # Offsets 1-5: name on a line above
-        for offset in range(1, 6):
-            if idx - offset < 0:
-                break
-            candidate = _is_short_token(lines[idx - offset])
-            if candidate:
-                offset_counts[offset] += 1
-                if len(offset_examples[offset]) < 5:
-                    offset_examples[offset].append(candidate)
-                break
-
-    total_ts = len(ts_indices)
-    patterns = []
-    for offset, count in offset_counts.items():
-        score = count / total_ts if total_ts else 0
-        patterns.append({
-            "token_offset": offset,
-            "score": round(score, 3),
-            "occurrences": count,
-            "examples": offset_examples[offset],
-        })
-
-    patterns.sort(key=lambda p: (-p["score"], -p["occurrences"]))
-    return patterns
-
-
-# ------------------------------------------------------------------
-# Record extraction
-# ------------------------------------------------------------------
-
-def extract_records(lines: list[str], pattern: dict) -> list[dict]:
-    """Walk the file and emit records wherever the pattern matches."""
     records = []
-    offset = pattern["token_offset"]
 
-    for idx, line in enumerate(lines):
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
         ts = _extract_timestamp(line)
         if not ts:
             continue
+
         hour, minute, date = ts
-        if date is None:
-            continue
 
-        if offset == 0:
-            name = _extract_name_from_line(line)
-        else:
-            token_idx = idx - offset
-            if token_idx < 0:
-                continue
-            name = _is_short_token(lines[token_idx])
+        # Find the raw time and date substrings so we can strip them before
+        # looking for the username.
+        time_match = re.search(r"\d{1,2}:\d{2}\s*[AaPp][Mm]?", line)
+        time_str = time_match.group(0) if time_match else ""
 
+        date_match = re.search(
+            r"(\d{4}-\d{1,2}-\d{1,2})|(\d{1,2}/\d{1,2}/\d{2,4})|(Today)|(Yesterday)",
+            line, re.IGNORECASE
+        )
+        date_str = date_match.group(0) if date_match else ""
+
+        name = _extract_username(line, time_str, date_str)
         if not name:
             continue
 
+        # If no date on the line, use today
+        if date is None:
+            date = datetime.now().date()
+
         dt = datetime.combine(date, datetime.min.time()).replace(hour=hour, minute=minute)
+
         records.append({
             "name": name,
             "timestamp": dt.isoformat(),
             "hour": hour,
             "minute": minute,
             "weekday": dt.strftime("%A"),
+            "ampm": "AM" if hour < 12 else "PM",
             "raw_line": line,
         })
 
-    return records
-
-
-def filter_by_consistency(records: list[dict], drop_below: float = 0.3) -> list[dict]:
-    """
-    Drop records whose username is rare.
-    Lowered threshold from 0.5 to 0.3 to handle multi-user logs.
-    """
-    if not records:
-        return records
-    name_counts = Counter(r["name"] for r in records)
-    threshold = len(records) * drop_below
-    return [r for r in records if name_counts[r["name"]] >= threshold]
-
-
-# ------------------------------------------------------------------
-# Main entry point
-# ------------------------------------------------------------------
-
-def parse_message_log(text: str, username_filter: Optional[str] = None) -> list[dict]:
-    """Parse an unorganized log by detecting the dominant repeating pattern."""
-    lines = text.splitlines()
-
-    patterns = detect_patterns(lines)
-    if not patterns:
-        return []
-
-    best = patterns[0]
-    records = extract_records(lines, best)
-    if not records:
-        return []
-
+    # Optional filter to one username
     if username_filter:
         target = username_filter.strip().lower()
-        records = [r for r in records if r["name"].strip().lower() == target]
+        records = [r for r in records if r["name"].lower() == target]
 
-    return filter_by_consistency(records)
+    # Sort chronologically
+    records.sort(key=lambda r: r["timestamp"])
 
-
-# ------------------------------------------------------------------
-# Quick test
-# ------------------------------------------------------------------
-
-if __name__ == "__main__":
-    SAMPLE = """
-Alice 2026-10-06 09:15
-Morning
-Bob 2026-10-06 09:20
-Morning
-Alice 2026-10-06 13:45
-Lunch?
-Bob 2026-10-06 13:50
-Sure
-Alice 2026-10-06 18:30
-Done for the day
-Bob 2026-10-06 18:35
-Same
-"""
-    print("=== PATTERNS ===")
-    for p in detect_patterns(SAMPLE.splitlines()):
-        print(f"  offset={p['token_offset']}  score={p['score']}  occurrences={p['occurrences']}  examples={p['examples']}")
-
-    print("\n=== RECORDS ===")
-    for r in parse_message_log(SAMPLE):
-        print(f"  {r['name']:<16} {r['weekday']:<10} {r['hour']:02d}:{r['minute']:02d}")
+    return records
