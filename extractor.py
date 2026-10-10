@@ -155,3 +155,13 @@ def extract_timestamps(text: str, target: str, ref: date, day_first: bool = Fals
 
     out.sort(key=lambda x: (x["date"], x["time"]))
     return out
+
+
+def decode_upload(data: bytes) -> str:
+    """Decode an uploaded text file: handles UTF-8 (with/without BOM), UTF-16, and legacy 8-bit."""
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16", errors="replace")
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return data.decode("cp1252", errors="replace")
